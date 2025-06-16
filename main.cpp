@@ -1,117 +1,149 @@
-#include <iostream>
+#include <mpi.h>
 #include <vector>
-#include <chrono>
+#include <iostream>
 #include <iomanip>
 #include <cmath>
+#include <cstdlib>
 
 using namespace std;
 
-void printMatrix(const vector<vector<double>>& matrix, const string& name) {
-    int n = matrix.size();
+void printMatrix(const vector<vector<double>>& mat, const string& name) {
     cout << "\n" << name << ":\n";
-    cout << fixed << setprecision(3);
-    for (int i = 0; i < n; ++i) {
-        for (int j = 0; j < n; ++j) {
-            cout << setw(10) << matrix[i][j] << " ";
-        }
+    for (const auto& row : mat) {
+        for (double val : row)
+            cout << setw(10) << fixed << setprecision(4) << val << " ";
         cout << "\n";
     }
 }
 
-bool invertMatrix(const vector<vector<double>>& input, vector<vector<double>>& inverse) {
-    int n = input.size();
-    inverse.assign(n, vector<double>(n, 0.0));
+int main(int argc, char** argv) {
+    MPI_Init(&argc, &argv);
 
-    vector<vector<double>> aug(n, vector<double>(2 * n));
-    for (int i = 0; i < n; ++i) {
-        for (int j = 0; j < n; ++j)
-            aug[i][j] = input[i][j];
-        aug[i][n + i] = 1.0;
-    }
+    int rank, size;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
 
-    for (int i = 0; i < n; ++i) {
-        double maxEl = fabs(aug[i][i]);
-        int maxRow = i;
-        for (int k = i + 1; k < n; ++k) {
-            if (fabs(aug[k][i]) > maxEl) {
-                maxEl = fabs(aug[k][i]);
-                maxRow = k;
-            }
-        }
-
-        if (fabs(maxEl) < 1e-12) {
-            cerr << "The matrix is degenerate, there is no inverse.\n";
-            return false;
-        }
-
-        swap(aug[i], aug[maxRow]);
-
-        double pivot = aug[i][i];
-        for (int j = 0; j < 2 * n; ++j)
-            aug[i][j] /= pivot;
-
-        for (int k = 0; k < n; ++k) {
-            if (k != i) {
-                double coeff = aug[k][i];
-                for (int j = 0; j < 2 * n; ++j)
-                    aug[k][j] -= coeff * aug[i][j];
-            }
-        }
-    }
-
-    for (int i = 0; i < n; ++i)
-        for (int j = 0; j < n; ++j)
-            inverse[i][j] = aug[i][j + n];
-
-    return true;
-}
-
-vector<vector<double>> generateRandomMatrix(int n) {
-    vector<vector<double>> matrix(n, vector<double>(n));
-    for (int i = 0; i < n; ++i)
-        for (int j = 0; j < n; ++j)
-            matrix[i][j] = ((rand() % 2001) - 1000) / 100.0;
-    return matrix;
-}
-
-int main() {
     int n;
-    cout << "Enter the dimension of the square matrix: ";
-    cin >> n;
 
-    if (n <= 0) {
-        cerr << "The dimension must be positive.\n";
-        return 1;
+    if (rank == 0) {
+        cout << "Enter matrix size: ";
+        cin >> n;
     }
 
-    srand(static_cast<unsigned>(time(0)));
+    MPI_Bcast(&n, 1, MPI_INT, 0, MPI_COMM_WORLD);
 
-    vector<vector<double>> A = generateRandomMatrix(n);
-    vector<vector<double>> A_inv;
+    int rows_per_proc = n / size;
+    int extra_rows = n % size;
+    int my_rows = rows_per_proc + (rank < extra_rows ? 1 : 0);
 
-    if (n <= 10)
-        printMatrix(A, "The generated matrix A");
+    vector<vector<double>> local_aug(my_rows, vector<double>(2 * n));
+    vector<vector<double>> full_matrix;
 
-    cout << "\nCalculation of the inverse matrix by the Gauss-Jordan method..." << endl;
+    if (rank == 0) {
+        srand(time(0));
+        full_matrix.assign(n, vector<double>(n));
+        for (auto& row : full_matrix)
+            for (auto& el : row)
+                el = rand() % 100 - 50;
 
-    auto start = chrono::high_resolution_clock::now();
+        for (int i = 0, dest = 0, offset = 0; i < n; ++i) {
+            for (int j = 0; j < n; ++j)
+                full_matrix[i].push_back((i == j) ? 1.0 : 0.0);
+        }
+    }
 
-    bool success = invertMatrix(A, A_inv);
+    vector<double> sendbuf, recvbuf(my_rows * 2 * n);
+    if (rank == 0) {
+        sendbuf.resize(n * 2 * n);
+        for (int i = 0; i < n; ++i)
+            for (int j = 0; j < 2 * n; ++j)
+                sendbuf[i * 2 * n + j] = full_matrix[i][j];
+    }
 
-    auto end = chrono::high_resolution_clock::now();
-    auto elapsed = chrono::duration_cast<chrono::milliseconds>(end - start);
+    vector<int> sendcounts(size), displs(size);
+    int offset = 0;
+    for (int i = 0; i < size; ++i) {
+        int count = (n / size + (i < extra_rows ? 1 : 0)) * 2 * n;
+        sendcounts[i] = count;
+        displs[i] = offset;
+        offset += count;
+    }
 
-    if (success) {
-        cout << "\nThe inverse matrix has been successfully found." << endl;
-        cout << "Lead time: " << elapsed.count() << " ms" << endl;
+    MPI_Scatterv(sendbuf.data(), sendcounts.data(), displs.data(), MPI_DOUBLE,
+                 recvbuf.data(), recvbuf.size(), MPI_DOUBLE,
+                 0, MPI_COMM_WORLD);
+
+    for (int i = 0; i < my_rows; ++i)
+        for (int j = 0; j < 2 * n; ++j)
+            local_aug[i][j] = recvbuf[i * 2 * n + j];
+
+    double start = MPI_Wtime();
+
+    for (int i = 0; i < n; ++i) {
+        int owner = 0, row_index = i;
+        int rows = 0, offset = 0;
+
+        for (int r = 0; r < size; ++r) {
+            int r_rows = n / size + (r < extra_rows ? 1 : 0);
+            if (row_index < offset + r_rows) {
+                owner = r;
+                row_index -= offset;
+                break;
+            }
+            offset += r_rows;
+        }
+
+        vector<double> pivot_row(2 * n);
+
+        if (rank == owner)
+            pivot_row = local_aug[row_index];
+
+        MPI_Bcast(pivot_row.data(), 2 * n, MPI_DOUBLE, owner, MPI_COMM_WORLD);
+
+        double pivot_val = pivot_row[i];
+        if (fabs(pivot_val) < 1e-12) {
+            if (rank == 0) cerr << "Matrix is degenerate.\n";
+            MPI_Abort(MPI_COMM_WORLD, 1);
+        }
+
+        for (int r = 0; r < my_rows; ++r) {
+            if (local_aug[r][i] == pivot_val && rank == owner && r == row_index)
+                continue;
+
+            double factor = local_aug[r][i];
+            for (int j = 0; j < 2 * n; ++j)
+                local_aug[r][j] -= factor * pivot_row[j];
+        }
+
+        if (rank == owner) {
+            for (int j = 0; j < 2 * n; ++j)
+                pivot_row[j] /= pivot_val;
+            local_aug[row_index] = pivot_row;
+        }
+    }
+
+    for (int i = 0; i < my_rows; ++i)
+        for (int j = 0; j < 2 * n; ++j)
+            recvbuf[i * 2 * n + j] = local_aug[i][j];
+MPI_Gatherv(recvbuf.data(), recvbuf.size(), MPI_DOUBLE,
+                sendbuf.data(), sendcounts.data(), displs.data(), MPI_DOUBLE,
+                0, MPI_COMM_WORLD);
+
+    double end = MPI_Wtime();
+
+    if (rank == 0) {
+        vector<vector<double>> inverse(n, vector<double>(n));
+        for (int i = 0; i < n; ++i)
+            for (int j = 0; j < n; ++j)
+                inverse[i][j] = sendbuf[i * 2 * n + j + n];
 
         if (n <= 10)
-            printMatrix(A_inv, "Inversed matrix A^(-1)");
-        else
-            cout << "The matrix is too big to display on the screen (n > 10)." << endl;
-    } else {
-        cout << "The inverse matrix could not be found." << endl;
+            printMatrix(inverse, "Inversed matrix");
+
+        cout << "Lead time: " << fixed << setprecision(3)
+             << (end - start) * 1000.0 << " ms\n";
     }
 
+    MPI_Finalize();
     return 0;
 }
